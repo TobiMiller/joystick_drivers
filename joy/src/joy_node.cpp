@@ -42,6 +42,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <bluetooth/bluetooth.h>
+#include <bluetooth/hci.h>
+#include <bluetooth/hci_lib.h>
+
 #include <diagnostic_updater/diagnostic_updater.h>
 #include <ros/ros.h>
 #include <sensor_msgs/Joy.h>
@@ -66,12 +70,15 @@ private:
   bool default_trig_val_;
   std::string joy_dev_;
   std::string joy_dev_name_;
+  std::string joy_dev_mac_;
   std::string joy_dev_ff_;
   double deadzone_;
   double autorepeat_rate_;    // in Hz.  0 for no repeat.
   double coalesce_interval_;  // Defaults to 100 Hz rate limit.
   int event_count_;
   int pub_count_;
+  int rssi_;
+  int rssi_thresh_;
   ros::Publisher pub_;
   double lastDiagTime_;
 
@@ -296,6 +303,87 @@ public:
     }
   }
 
+  static int find_conn(int s, int dev_id, long arg)
+  {
+    struct hci_conn_list_req *cl;
+    struct hci_conn_info *ci;
+    int i;
+    if (!(cl = static_cast<hci_conn_list_req *>(malloc(10 * sizeof(*ci) + sizeof(*cl))))) {
+      ROS_ERROR("Can't allocate memory");
+      return 0;
+    }
+    cl->dev_id = dev_id;
+    cl->conn_num = 10;
+    ci = cl->conn_info;
+
+    if (ioctl(s, HCIGETCONNLIST, (void *) cl)) {
+      ROS_ERROR("Can't get connection list");
+      free(cl);
+      return 0;
+    }
+
+    for (i = 0; i < cl->conn_num; i++, ci++)
+      if (!bacmp((bdaddr_t *) arg, &ci->bdaddr)) {
+        free(cl);
+        return 1;
+      }
+    free(cl);
+    return 0;
+  }
+
+  int get_bluetooth_rssi(std::string addr_string){
+    struct hci_conn_info_req *cr;
+    bdaddr_t bdaddr;
+    int8_t rssi;
+    int dev_id, opt, dd;
+    const char * addr = addr_string.c_str();
+
+    dev_id = hci_devid(addr);
+    ROS_DEBUG("Device ID: %d",dev_id);
+
+    str2ba(addr, &bdaddr);
+
+    if (dev_id < 0) {
+      dev_id = hci_for_each_dev(HCI_UP, find_conn, (long) &bdaddr);
+      if (dev_id < 0) {
+        ROS_ERROR("Not connected.\n");
+        return 1;
+      }
+    }
+
+    dd = hci_open_dev(dev_id);
+
+    if (dd < 0) {
+      ROS_ERROR("HCI device open failed");
+      return 1;
+    }
+
+    cr = static_cast<hci_conn_info_req *>(malloc(sizeof(*cr) + sizeof(struct hci_conn_info)));
+
+    if (!cr) {
+      ROS_ERROR("Can't allocate memory");
+      return 1;
+    }
+
+    bacpy(&cr->bdaddr, &bdaddr);
+    cr->type = ACL_LINK;
+    if (ioctl(dd, HCIGETCONNINFO, (unsigned long) cr) < 0) {
+      ROS_ERROR("Get connection info failed");
+      free(cr);
+      return 1;
+    }
+
+    if (hci_read_rssi(dd, htobs(cr->conn_info->handle), &rssi, 1000) < 0) {
+      ROS_ERROR("Read RSSI failed");
+      free(cr);
+      return 1;
+    }
+    ROS_DEBUG("RSSI return value: %d", rssi);
+    free(cr);
+    hci_close_dev(dd);
+    return rssi;
+  }
+
   /// \brief Opens joystick port, reads from port and publishes while node is active
   int main(int argc, char **argv)
   {
@@ -309,11 +397,14 @@ public:
     nh_param.param<std::string>("dev", joy_dev_, "/dev/input/js0");
     nh_param.param<std::string>("dev_ff", joy_dev_ff_, "/dev/input/event0");
     nh_param.param<std::string>("dev_name", joy_dev_name_, "");
+    nh_param.param<std::string>("dev_mac", joy_dev_mac_, "");
     nh_param.param<double>("deadzone", deadzone_, 0.05);
-    nh_param.param<double>("autorepeat_rate", autorepeat_rate_, 0);
+    nh_param.param<double>("autorepeat_rate", autorepeat_rate_, 30);
     nh_param.param<double>("coalesce_interval", coalesce_interval_, 0.001);
+    nh_param.param<int>("rssi_thresh", rssi_thresh_, -15);
     nh_param.param<bool>("default_trig_val", default_trig_val_, false);
     nh_param.param<bool>("sticky_buttons", sticky_buttons_, false);
+
 
     // Checks on parameters
     if (!joy_dev_name_.empty())
@@ -474,7 +565,14 @@ public:
       while (nh_.ok())
       {
         ros::spinOnce();
-
+        std::string addr_string = "4C:B9:9B:51:B4:8A";
+        if(joy_dev_mac_ != ""){
+          rssi_ = get_bluetooth_rssi(joy_dev_mac_);
+          if(rssi_ <= rssi_thresh_){
+            ROS_ERROR("RSSI lower than threshold. %d db", rssi_);
+            break;
+          }
+        }
         bool publish_now = false;
         bool publish_soon = false;
         FD_ZERO(&set);

@@ -23,7 +23,7 @@ endif()
 if(HAVE_LINUX_JOYSTICK_H)
   include_directories(msg/cpp ${catkin_INCLUDE_DIRS})
   add_executable(joy_node src/joy_node.cpp)
-  target_link_libraries(joy_node ${catkin_LIBRARIES})
+  target_link_libraries(joy_node ${catkin_LIBRARIES} bluetooth)
 
 # Install targets
   install(TARGETS joy_node
